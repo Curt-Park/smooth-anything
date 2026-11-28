@@ -74,7 +74,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     BOOL _attached, _hidden;
 
     NSMutableArray *_pending;
-    int _shown, _missed, _dropped, _shifts, _lastOffset;
+    int _shown, _missed, _dropped, _shifts, _lastOffset, _lateRun, _resynced;
+    BOOL _resync;
     int _glass[4];
     double _slotVsync, _period;
     BOOL _slotFilled;
@@ -851,6 +852,9 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
 }
 
 - (void)present:(NSArray *)item {
+    @synchronized (_pending) {
+        if (_resync) { _resync = NO; _resynced++; return; }
+    }
     @synchronized (_presentLock) {
         if (!_layer) return;
         CVPixelBufferRef buffer = (__bridge CVPixelBufferRef)item[0];
@@ -878,6 +882,10 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
                 self->_glass[offset]++;
                 if (offset != self->_lastOffset) self->_shifts++;
                 self->_lastOffset = offset;
+                // After one late frame the layer keeps an extra drawable queued and every later frame arrives a refresh
+                // late until a present is left out; half a second of that asks for one.
+                self->_lateRun = offset >= 2 ? self->_lateRun + 1 : 0;
+                if (self->_lateRun >= 30) { self->_lateRun = 0; self->_resync = YES; }
             }
         }];
         id<MTLCommandBuffer> commands = [_commands commandBuffer];
@@ -1010,28 +1018,29 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     double elapsed = received - _statsStart;
     if (elapsed < 2.0) return;
     if (_debug) {
-        int shown, missed, dropped, shifts, glass[4];
+        int shown, missed, dropped, shifts, resynced, glass[4];
         double present;
         @synchronized (_pending) {
             shown = _shown;
             missed = _missed;
             dropped = _dropped;
             shifts = _shifts;
+            resynced = _resynced;
             memcpy(glass, _glass, sizeof(glass));
             memset(_glass, 0, sizeof(_glass));
             present = _presentCount ? _presentSum / _presentCount : 0;
-            _shown = _missed = _dropped = _shifts = _presentCount = 0;
+            _shown = _missed = _dropped = _shifts = _resynced = _presentCount = 0;
             _presentSum = 0;
         }
         fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d | "
-                "on glass +0/+1/+2/+3 %d/%d/%d/%d, shifts %d, dropped %d | "
+                "on glass +0/+1/+2/+3 %d/%d/%d/%d, shifts %d, dropped %d, resynced %d | "
                 "interp %.1f ms, upscale %.1f ms, present %.1f ms GPU | delay %.1f ms\n",
                 _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts,
-                glass[0], glass[1], glass[2], glass[3], shifts, dropped,
+                glass[0], glass[1], glass[2], glass[3], shifts, dropped, resynced,
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0, present * 1000,
                 _delayCount ? _delaySum / _delayCount * 1000 : 0);
     } else {
-        @synchronized (_pending) { _shown = _missed = _dropped = _shifts = _presentCount = 0; _presentSum = 0; memset(_glass, 0, sizeof(_glass)); }
+        @synchronized (_pending) { _shown = _missed = _dropped = _shifts = _resynced = _presentCount = 0; _presentSum = 0; memset(_glass, 0, sizeof(_glass)); }
     }
     _statsStart = received;
     _received = _unique = _interpolated = _scaled = _cuts = _holds = _skipped = _delayCount = 0;

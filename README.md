@@ -75,6 +75,6 @@ downloaded app.
 | `SMOOTH_FLOW=1` | Experimental: make middle frames by moving the stream's own pixels half way along `VTOpticalFlow` (run on 640x360 copies) instead of the interpolation network. Meant for Macs that fall back to 720p interpolation, whose network loses background texture in fast camera moves |
 | `SMOOTH_UPSCALE=0` | Let Core Animation stretch the frame instead of MetalFX upscaling and sharpening |
 | `SMOOTH_SHARPEN=<0–1>` | Sharpening strength after the MetalFX upscale. Default 0.7; 0 turns it off |
-| `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder) |
+| `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder; `resynced` counts the presents left out to get back in step after half a second of frames a refresh late) |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |
 | `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison. When interpolation runs below the stream's size, the two real frames are also saved at the stream's size (`na`, `nb`) |
