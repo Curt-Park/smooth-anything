@@ -52,7 +52,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferPoolRef _flowInputPool, _flowFieldPool, _warpPool;
     CVPixelBufferRef _previousFlowInput, _currentFlowInput;
     id<MTLRenderPipelineState> _shrinkPipeline, _choosePipeline, _settlePipeline, _warpLumaPipeline, _warpChromaPipeline;
-    id<MTLTexture> _quarterFirst, _quarterSecond, _chosen, _settled;
+    id<MTLRenderPipelineState> _finishLumaPipeline, _finishChromaPipeline;
+    id<MTLTexture> _quarterFirst, _quarterSecond, _chosen, _settled, _crispLuma, _crispChroma, _quarterCrisp;
     CVPixelBufferPoolRef _smallPool;
 
     id<MTLDevice> _device;
@@ -239,7 +240,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    }\n"
         "    error = price(first, second, in.uv, float2(0.0), here, there, toPixels);\n"
         "    if (error < bestError) { bestError = error; best = float2(0.0); }\n"
-        "    return float4(best, 0.0, 1.0);\n"
+        "    return float4(best, bestError, 1.0);\n"
         "}\n"
         // Removes stray choices by taking the most central of the 3x3 motions around a point. An average would invent
         // motions between a limb's and the background's, and pixels moved by those drew thin lines around the character.
@@ -254,7 +255,22 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "        for (int j = 0; j < 9; j++) cost += distance(around[i], around[j]);\n"
         "        if (cost < bestCost) { bestCost = cost; best = around[i]; }\n"
         "    }\n"
-        "    return float4(best, 0.0, 1.0);\n"
+        "    float cost = 0.0;\n"
+        "    for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) cost += motion.sample(exact, in.uv + float2(x, y) * texel).b / 25.0;\n"
+        "    return float4(best, cost, 1.0);\n"
+        "}\n"
+        // Beside a fast-moving outline only one real frame shows what is there, no motion matches, and the pixels brought
+        // in came out as hard fragments. Where the chosen motions cost more than 6 luma levels a tap the picture fades
+        // into a blurred copy of itself (fully at 16), which reads as motion blur.
+        "fragment float4 finish(Out in [[stage_in]], texture2d<float> crisp [[texture(0)]], texture2d<float> soft [[texture(1)]],\n"
+        "                       texture2d<float> chosen [[texture(2)]], constant float &spacing [[buffer(0)]]) {\n"
+        "    float4 sharp = crisp.sample(smooth, in.uv);\n"
+        "    float doubt = saturate((chosen.sample(smooth, in.uv).b * 255.0 / 9.0 - 6.0) / 10.0);\n"
+        "    if (doubt <= 0.0) return sharp;\n"
+        "    float2 texel = spacing / float2(soft.get_width(), soft.get_height());\n"
+        "    float4 blurred = float4(0.0);\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) blurred += soft.sample(smooth, in.uv + float2(x, y) * texel) / 9.0;\n"
+        "    return mix(sharp, blurred, doubt);\n"
         "}\n"
         "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
         "                     texture2d<float> chosen [[texture(2)]], texture2d<float> forward [[texture(3)]],\n"
@@ -300,8 +316,9 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
     id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"fullscreen"];
-    NSArray *stages = @[@[@"shrink", @(MTLPixelFormatR8Unorm)], @[@"choose", @(MTLPixelFormatRG16Float)], @[@"settle", @(MTLPixelFormatRG16Float)],
-                        @[@"warp", @(MTLPixelFormatR8Unorm)], @[@"warp", @(MTLPixelFormatRG8Unorm)]];
+    NSArray *stages = @[@[@"shrink", @(MTLPixelFormatR8Unorm)], @[@"choose", @(MTLPixelFormatRGBA16Float)], @[@"settle", @(MTLPixelFormatRGBA16Float)],
+                        @[@"warp", @(MTLPixelFormatR8Unorm)], @[@"warp", @(MTLPixelFormatRG8Unorm)],
+                        @[@"finish", @(MTLPixelFormatR8Unorm)], @[@"finish", @(MTLPixelFormatRG8Unorm)]];
     NSMutableArray<id<MTLRenderPipelineState>> *pipelines = [NSMutableArray array];
     for (NSArray *stage in stages) {
         descriptor.fragmentFunction = [library newFunctionWithName:stage[0]];
@@ -319,6 +336,8 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
     _settlePipeline = pipelines[2];
     _warpLumaPipeline = pipelines[3];
     _warpChromaPipeline = pipelines[4];
+    _finishLumaPipeline = pipelines[5];
+    _finishChromaPipeline = pipelines[6];
     NSDictionary *field = config.destinationPixelBufferAttributes;
     _flowInputFormat = config.frameSupportedPixelFormats.firstObject.unsignedIntValue;
     _flowInputPool = NewPlainPool(_flowInputFormat, kFlowWidth, kFlowHeight);
@@ -383,12 +402,21 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                 small.storageMode = MTLStorageModePrivate;
                 _quarterFirst = [_device newTextureWithDescriptor:small];
                 _quarterSecond = [_device newTextureWithDescriptor:small];
-                small.pixelFormat = MTLPixelFormatRG16Float;
+                _quarterCrisp = [_device newTextureWithDescriptor:small];
+                small.pixelFormat = MTLPixelFormatRGBA16Float;
                 _chosen = [_device newTextureWithDescriptor:small];
                 _settled = [_device newTextureWithDescriptor:small];
+                small.pixelFormat = MTLPixelFormatR8Unorm;
+                small.width = width;
+                small.height = height;
+                _crispLuma = [_device newTextureWithDescriptor:small];
+                small.pixelFormat = MTLPixelFormatRG8Unorm;
+                small.width = width / 2;
+                small.height = height / 2;
+                _crispChroma = [_device newTextureWithDescriptor:small];
             }
             id<MTLTexture> firstLuma = nil, secondLuma = nil;
-            BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _chosen && _settled;
+            BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _quarterCrisp && _chosen && _settled && _crispLuma && _crispChroma;
             for (size_t plane = 0; plane < 2 && drawn; plane++) {
                 MTLPixelFormat planeFormat = plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm;
                 id<MTLTexture> first = [self texture:previous plane:plane format:planeFormat keep:keep];
@@ -403,9 +431,15 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                          value:(float)width / (float)forwardTexture.width commands:commands];
                     [self draw:_settlePipeline into:_settled from:@[_chosen] value:0 commands:commands];
                 }
-                if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target
-                                 from:@[first, second, _settled, forwardTexture, backwardTexture, firstLuma, secondLuma]
-                                value:(float)width / (float)forwardTexture.width commands:commands];
+                if (drawn) {
+                    id<MTLTexture> crisp = plane ? _crispChroma : _crispLuma;
+                    [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:crisp
+                          from:@[first, second, _settled, forwardTexture, backwardTexture, firstLuma, secondLuma]
+                         value:(float)width / (float)forwardTexture.width commands:commands];
+                    if (plane == 0) [self draw:_shrinkPipeline into:_quarterCrisp from:@[crisp] value:0 commands:commands];
+                    [self draw:(plane ? _finishChromaPipeline : _finishLumaPipeline) into:target from:@[crisp, plane ? crisp : _quarterCrisp, _settled]
+                         value:(plane ? 3.0f : 1.5f) commands:commands];
+                }
             }
             if (drawn) {
                 [commands commit];
