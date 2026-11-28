@@ -195,6 +195,12 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    }\n"
         "    return total;\n"
         "}\n"
+        // A thin trunk crossing plain sky matches perfectly with "no motion" too, which punched holes in it, so a motion
+        // pays up to 8 luma levels a tap for departing (by up to 8 pixels) from the flow measured at the point.
+        "static float price(texture2d<float> first, texture2d<float> second, float2 uv, float2 motion, float2 here, float2 there, float2 toPixels) {\n"
+        "    float departure = min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels));\n"
+        "    return mismatch(first, second, uv, motion) + 72.0 / 255.0 * min(departure, 8.0) / 8.0;\n"
+        "}\n"
         // The flow field is coarse and blends motions where a limb crosses the background, which doubled outlines. Each
         // point instead takes, from the motions of the nearby flow cells and no motion at all (overlays), the best match.
         "fragment float4 choose(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
@@ -202,24 +208,31 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "                       constant float &pixelsPerCell [[buffer(0)]]) {\n"
         "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
         "    float2 here = forward.sample(smooth, in.uv).rg * cell, there = -backward.sample(smooth, in.uv).rg * cell;\n"
-        "    float2 best = here;\n"
-        "    float bestError = mismatch(first, second, in.uv, best);\n"
-        "    float error = mismatch(first, second, in.uv, there);\n"
-        "    if (error < bestError) { bestError = error; best = there; }\n"
-        // A thin trunk crossing plain sky matches perfectly with the sky's motion too, which punched holes in it, so a
-        // motion pays up to 8 luma levels a tap for departing (by up to 8 pixels) from the flow measured at the point.
         "    float2 toPixels = pixelsPerCell / cell;\n"
-        "    float2 motion = float2(0.0);\n"
-        "    error = mismatch(first, second, in.uv, motion)\n"
-        "          + 72.0 / 255.0 * min(min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels)), 8.0) / 8.0;\n"
-        "    if (error < bestError) { bestError = error; best = motion; }\n"
+        "    float2 best = here;\n"
+        "    float bestError = price(first, second, in.uv, best, here, there, toPixels);\n"
+        "    float error = price(first, second, in.uv, there, here, there, toPixels);\n"
+        "    if (error < bestError) { bestError = error; best = there; }\n"
         "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) for (int side = 0; side < 2; side++) {\n"
         "        float2 at = in.uv + float2(x, y) * cell;\n"
-        "        motion = side == 0 ? forward.sample(exact, at).rg * cell : -backward.sample(exact, at).rg * cell;\n"
-        "        error = mismatch(first, second, in.uv, motion)\n"
-        "              + 72.0 / 255.0 * min(min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels)), 8.0) / 8.0;\n"
+        "        float2 motion = side == 0 ? forward.sample(exact, at).rg * cell : -backward.sample(exact, at).rg * cell;\n"
+        "        error = price(first, second, in.uv, motion, here, there, toPixels);\n"
         "        if (error < bestError) { bestError = error; best = motion; }\n"
         "    }\n"
+        // A near, thin object moves a few pixels differently from every flow cell around it (a trunk 80 pixels against
+        // 88 for what is behind it), and off by that much it does not match itself. Nudging the best motion by 6 and
+        // then 3 pixels finds it before "no motion" is tried.
+        "    for (int round = 0; round < 2; round++) {\n"
+        "        float2 from = best;\n"
+        "        float reach = round == 0 ? 6.0 : 3.0;\n"
+        "        for (int i = 0; i < 4; i++) {\n"
+        "            float2 motion = from + (i < 2 ? float2(i == 0 ? reach : -reach, 0.0) : float2(0.0, i == 2 ? reach : -reach)) / toPixels;\n"
+        "            error = price(first, second, in.uv, motion, here, there, toPixels);\n"
+        "            if (error < bestError) { bestError = error; best = motion; }\n"
+        "        }\n"
+        "    }\n"
+        "    error = price(first, second, in.uv, float2(0.0), here, there, toPixels);\n"
+        "    if (error < bestError) { bestError = error; best = float2(0.0); }\n"
         "    return float4(best, 0.0, 1.0);\n"
         "}\n"
         // Removes stray choices by taking the most central of the 3x3 motions around a point. An average would invent
