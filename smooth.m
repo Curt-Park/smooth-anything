@@ -71,7 +71,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     double _slotVsync, _period;
     BOOL _slotFilled;
 
-    CVPixelBufferRef _previousFrame;
+    CVPixelBufferRef _previousFrame, _previousNative;
     double _previousTime;
     uint8_t *_previousSamples;
     size_t _sampleCount;
@@ -237,19 +237,29 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
 }
 
-- (void)dumpPrevious:(CVPixelBufferRef)previous middle:(CVPixelBufferRef)middle current:(CVPixelBufferRef)current {
+- (void)dumpPrevious:(CVPixelBufferRef)previous middle:(CVPixelBufferRef)middle current:(CVPixelBufferRef)current
+       nativePrevious:(CVPixelBufferRef)nativePrevious nativeCurrent:(CVPixelBufferRef)nativeCurrent {
     int index = _dumpCount++;
     double mean = _lastMean;
     NSString *directory = _dumpDirectory;
     CVPixelBufferRetain(previous);
     CVPixelBufferRetain(middle);
     CVPixelBufferRetain(current);
+    CVPixelBufferRetain(nativePrevious);
+    CVPixelBufferRetain(nativeCurrent);
     dispatch_async(_dumpQueue, ^{
         NSString *size = [NSString stringWithFormat:@"%zux%zu", CVPixelBufferGetWidth(middle), CVPixelBufferGetHeight(middle)];
         WriteNV12(previous, [directory stringByAppendingFormat:@"/%02d_a_%@.nv12", index, size]);
         WriteNV12(middle, [directory stringByAppendingFormat:@"/%02d_m_%@.nv12", index, size]);
         WriteNV12(current, [directory stringByAppendingFormat:@"/%02d_b_%@.nv12", index, size]);
+        if (nativePrevious && nativePrevious != previous) {
+            NSString *nativeSize = [NSString stringWithFormat:@"%zux%zu", CVPixelBufferGetWidth(nativeCurrent), CVPixelBufferGetHeight(nativeCurrent)];
+            WriteNV12(nativePrevious, [directory stringByAppendingFormat:@"/%02d_na_%@.nv12", index, nativeSize]);
+            WriteNV12(nativeCurrent, [directory stringByAppendingFormat:@"/%02d_nb_%@.nv12", index, nativeSize]);
+        }
         fprintf(stderr, "smooth: dumped %02d (mean %.2f, %s)\n", index, mean, size.UTF8String);
+        CVPixelBufferRelease(nativePrevious);
+        CVPixelBufferRelease(nativeCurrent);
         CVPixelBufferRelease(previous);
         CVPixelBufferRelease(middle);
         CVPixelBufferRelease(current);
@@ -614,6 +624,8 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     CVPixelBufferRelease(_previousFrame);
     _previousFrame = _restFrame;
     _previousTime = _restTime;
+    CVPixelBufferRelease(_previousNative);
+    _previousNative = NULL;
     _restFrame = NULL;
     CVPixelBufferRelease(_restNative);
     _restNative = NULL;
@@ -657,7 +669,7 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
             CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
             _interpSum += HostNow() - begin;
             if (middle && _dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
-                [self dumpPrevious:_previousFrame middle:middle current:input];
+                [self dumpPrevious:_previousFrame middle:middle current:input nativePrevious:_previousNative nativeCurrent:native];
             }
             if (middle) {
                 _interpolated++;
@@ -691,6 +703,8 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
         CVPixelBufferRelease(_previousFrame);
         _previousFrame = CVPixelBufferRetain(input);
         _previousTime = received;
+        CVPixelBufferRelease(_previousNative);
+        _previousNative = _dumpDirectory ? CVPixelBufferRetain(native) : NULL;
     }
 
     double elapsed = received - _statsStart;

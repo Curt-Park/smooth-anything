@@ -78,4 +78,4 @@ downloaded app.
 | `SMOOTH_SHARPEN=<0–1>` | Sharpening strength after the MetalFX upscale. Default 0.7; 0 turns it off |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder) |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |
-| `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison |
+| `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison. When interpolation runs below the stream's size, the two real frames are also saved at the stream's size (`na`, `nb`) |
