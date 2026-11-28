@@ -51,8 +51,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     OSType _flowInputFormat;
     CVPixelBufferPoolRef _flowInputPool, _flowFieldPool, _warpPool;
     CVPixelBufferRef _previousFlowInput, _currentFlowInput;
-    id<MTLRenderPipelineState> _shrinkPipeline, _choosePipeline, _softenPipeline, _warpLumaPipeline, _warpChromaPipeline;
-    id<MTLTexture> _quarterFirst, _quarterSecond, _chosen, _softened;
+    id<MTLRenderPipelineState> _shrinkPipeline, _choosePipeline, _settlePipeline, _warpLumaPipeline, _warpChromaPipeline;
+    id<MTLTexture> _quarterFirst, _quarterSecond, _chosen, _settled;
     CVPixelBufferPoolRef _smallPool;
 
     id<MTLDevice> _device;
@@ -218,17 +218,36 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    }\n"
         "    return float4(best, 0.0, 1.0);\n"
         "}\n"
-        "fragment float4 soften(Out in [[stage_in]], texture2d<float> motion [[texture(0)]]) {\n"
+        // Removes stray choices by taking the most central of the 3x3 motions around a point. An average would invent
+        // motions between a limb's and the background's, and pixels moved by those drew thin lines around the character.
+        "fragment float4 settle(Out in [[stage_in]], texture2d<float> motion [[texture(0)]]) {\n"
         "    float2 texel = 1.0 / float2(motion.get_width(), motion.get_height());\n"
-        "    float4 total = float4(0.0);\n"
-        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) total += motion.sample(exact, in.uv + float2(x, y) * texel);\n"
-        "    return total / 9.0;\n"
+        "    float2 around[9];\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) around[(y + 1) * 3 + x + 1] = motion.sample(exact, in.uv + float2(x, y) * texel).rg;\n"
+        "    float2 best = around[4];\n"
+        "    float bestCost = 1e9;\n"
+        "    for (int i = 0; i < 9; i++) {\n"
+        "        float cost = 0.0;\n"
+        "        for (int j = 0; j < 9; j++) cost += distance(around[i], around[j]);\n"
+        "        if (cost < bestCost) { bestCost = cost; best = around[i]; }\n"
+        "    }\n"
+        "    return float4(best, 0.0, 1.0);\n"
         "}\n"
         "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
         "                     texture2d<float> chosen [[texture(2)]], texture2d<float> forward [[texture(3)]],\n"
         "                     texture2d<float> backward [[texture(4)]], constant float &pixelsPerCell [[buffer(0)]]) {\n"
         "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
-        "    float2 motion = chosen.sample(smooth, in.uv).rg;\n"
+        // Blends the motion between the four chosen points around this pixel only where they agree within 2 pixels.
+        "    float2 size = float2(chosen.get_width(), chosen.get_height());\n"
+        "    float2 place = in.uv * size - 0.5, corner = floor(place), part = place - corner;\n"
+        "    float2 limit = size - 1.0;\n"
+        "    float2 m00 = chosen.read(uint2(clamp(corner, float2(0.0), limit))).rg, m10 = chosen.read(uint2(clamp(corner + float2(1, 0), float2(0.0), limit))).rg;\n"
+        "    float2 m01 = chosen.read(uint2(clamp(corner + float2(0, 1), float2(0.0), limit))).rg, m11 = chosen.read(uint2(clamp(corner + float2(1, 1), float2(0.0), limit))).rg;\n"
+        "    float2 motion = part.y < 0.5 ? (part.x < 0.5 ? m00 : m10) : (part.x < 0.5 ? m01 : m11);\n"
+        "    float2 toPixels = pixelsPerCell / cell;\n"
+        "    float spread = max(max(distance(m00 * toPixels, motion * toPixels), distance(m10 * toPixels, motion * toPixels)),\n"
+        "                       max(distance(m01 * toPixels, motion * toPixels), distance(m11 * toPixels, motion * toPixels)));\n"
+        "    if (spread < 2.0) motion = mix(mix(m00, m10, part.x), mix(m01, m11, part.x), part.y);\n"
         "    float2 fromFirst = in.uv - 0.5 * motion, fromSecond = in.uv + 0.5 * motion;\n"
         // A source whose own flow disagrees with the motion is hidden or new in that frame, so the other one counts more.
         "    float2 firstError = (forward.sample(smooth, fromFirst).rg * cell - motion) / cell * pixelsPerCell;\n"
@@ -241,7 +260,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
     id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"fullscreen"];
-    NSArray *stages = @[@[@"shrink", @(MTLPixelFormatR8Unorm)], @[@"choose", @(MTLPixelFormatRG16Float)], @[@"soften", @(MTLPixelFormatRG16Float)],
+    NSArray *stages = @[@[@"shrink", @(MTLPixelFormatR8Unorm)], @[@"choose", @(MTLPixelFormatRG16Float)], @[@"settle", @(MTLPixelFormatRG16Float)],
                         @[@"warp", @(MTLPixelFormatR8Unorm)], @[@"warp", @(MTLPixelFormatRG8Unorm)]];
     NSMutableArray<id<MTLRenderPipelineState>> *pipelines = [NSMutableArray array];
     for (NSArray *stage in stages) {
@@ -257,7 +276,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
     }
     _shrinkPipeline = pipelines[0];
     _choosePipeline = pipelines[1];
-    _softenPipeline = pipelines[2];
+    _settlePipeline = pipelines[2];
     _warpLumaPipeline = pipelines[3];
     _warpChromaPipeline = pipelines[4];
     NSDictionary *field = config.destinationPixelBufferAttributes;
@@ -326,9 +345,9 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                 _quarterSecond = [_device newTextureWithDescriptor:small];
                 small.pixelFormat = MTLPixelFormatRG16Float;
                 _chosen = [_device newTextureWithDescriptor:small];
-                _softened = [_device newTextureWithDescriptor:small];
+                _settled = [_device newTextureWithDescriptor:small];
             }
-            BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _chosen && _softened;
+            BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _chosen && _settled;
             for (size_t plane = 0; plane < 2 && drawn; plane++) {
                 MTLPixelFormat planeFormat = plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm;
                 id<MTLTexture> first = [self texture:previous plane:plane format:planeFormat keep:keep];
@@ -339,10 +358,10 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                     [self draw:_shrinkPipeline into:_quarterFirst from:@[first] value:0 commands:commands];
                     [self draw:_shrinkPipeline into:_quarterSecond from:@[second] value:0 commands:commands];
                     [self draw:_choosePipeline into:_chosen from:@[_quarterFirst, _quarterSecond, forwardTexture, backwardTexture] value:0 commands:commands];
-                    [self draw:_softenPipeline into:_softened from:@[_chosen] value:0 commands:commands];
+                    [self draw:_settlePipeline into:_settled from:@[_chosen] value:0 commands:commands];
                 }
                 if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target
-                                 from:@[first, second, _softened, forwardTexture, backwardTexture]
+                                 from:@[first, second, _settled, forwardTexture, backwardTexture]
                                 value:(float)width / (float)forwardTexture.width commands:commands];
             }
             if (drawn) {
