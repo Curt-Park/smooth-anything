@@ -51,7 +51,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     OSType _flowInputFormat;
     CVPixelBufferPoolRef _flowInputPool, _flowFieldPool, _warpPool;
     CVPixelBufferRef _previousFlowInput, _currentFlowInput;
-    id<MTLRenderPipelineState> _warpLumaPipeline, _warpChromaPipeline;
+    id<MTLRenderPipelineState> _shrinkPipeline, _choosePipeline, _softenPipeline, _warpLumaPipeline, _warpChromaPipeline;
+    id<MTLTexture> _quarterFirst, _quarterSecond, _chosen, _softened;
     CVPixelBufferPoolRef _smallPool;
 
     id<MTLDevice> _device;
@@ -176,38 +177,89 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    float2 p = float2((id << 1) & 2, id & 2);\n"
         "    Out o; o.position = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
         "}\n"
-        "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
-        "                     texture2d<float> forward [[texture(2)]], texture2d<float> backward [[texture(3)]],\n"
-        "                     constant float &pixelsPerCell [[buffer(0)]]) {\n"
-        "    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
+        "constexpr sampler smooth(address::clamp_to_edge, filter::linear);\n"
+        "constexpr sampler exact(address::clamp_to_edge, filter::nearest);\n"
+        // A quarter-size copy: four bilinear taps average each 4x4 block.
+        "fragment float4 shrink(Out in [[stage_in]], texture2d<float> image [[texture(0)]]) {\n"
+        "    float2 texel = 1.0 / float2(image.get_width(), image.get_height());\n"
+        "    return 0.25 * (image.sample(smooth, in.uv + texel * float2(-1, -1)) + image.sample(smooth, in.uv + texel * float2(1, -1))\n"
+        "                 + image.sample(smooth, in.uv + texel * float2(-1, 1)) + image.sample(smooth, in.uv + texel * float2(1, 1)));\n"
+        "}\n"
+        // How unlike the two real frames are at the two ends of a motion through this point, over a 3x3 grid of taps.
+        "static float mismatch(texture2d<float> first, texture2d<float> second, float2 uv, float2 motion) {\n"
+        "    float2 texel = 2.0 / float2(first.get_width(), first.get_height());\n"
+        "    float total = 0.0;\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "        float2 at = uv + float2(x, y) * texel;\n"
+        "        total += abs(first.sample(smooth, at - 0.5 * motion).r - second.sample(smooth, at + 0.5 * motion).r);\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n"
+        // The flow field is coarse and blends motions where a limb crosses the background, which doubled outlines. Each
+        // point instead takes, from the motions of the nearby flow cells and no motion at all (overlays), the best match.
+        "fragment float4 choose(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
+        "                       texture2d<float> forward [[texture(2)]], texture2d<float> backward [[texture(3)]]) {\n"
         "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
-        // Half the flow, read where this middle-frame pixel started from, points back into each real frame.
-        "    float2 f = forward.sample(s, in.uv).rg * cell;\n"
-        "    f = forward.sample(s, in.uv - 0.5 * f).rg * cell;\n"
-        "    float2 b = backward.sample(s, in.uv).rg * cell;\n"
-        "    b = backward.sample(s, in.uv - 0.5 * b).rg * cell;\n"
-        "    float2 fromFirst = in.uv - 0.5 * f, fromSecond = in.uv - 0.5 * b;\n"
-        // The two flows should be opposite; where they are not, that side is hidden or new, so the other one counts more.
-        "    float2 firstError = (f + backward.sample(s, in.uv + 0.5 * f).rg * cell) / cell * pixelsPerCell;\n"
-        "    float2 secondError = (b + forward.sample(s, in.uv + 0.5 * b).rg * cell) / cell * pixelsPerCell;\n"
-        "    float firstWeight = 1.0 / (1.0 + dot(firstError, firstError)), secondWeight = 1.0 / (1.0 + dot(secondError, secondError));\n"
+        "    float2 best = forward.sample(smooth, in.uv).rg * cell;\n"
+        "    float bestError = mismatch(first, second, in.uv, best);\n"
+        "    float2 motion = -backward.sample(smooth, in.uv).rg * cell;\n"
+        "    float error = mismatch(first, second, in.uv, motion);\n"
+        "    if (error < bestError) { bestError = error; best = motion; }\n"
+        "    error = mismatch(first, second, in.uv, float2(0.0));\n"
+        "    if (error < bestError) { bestError = error; best = float2(0.0); }\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "        float2 at = in.uv + float2(x, y) * cell;\n"
+        "        motion = forward.sample(exact, at).rg * cell;\n"
+        "        error = mismatch(first, second, in.uv, motion);\n"
+        "        if (error < bestError) { bestError = error; best = motion; }\n"
+        "        motion = -backward.sample(exact, at).rg * cell;\n"
+        "        error = mismatch(first, second, in.uv, motion);\n"
+        "        if (error < bestError) { bestError = error; best = motion; }\n"
+        "    }\n"
+        "    return float4(best, 0.0, 1.0);\n"
+        "}\n"
+        "fragment float4 soften(Out in [[stage_in]], texture2d<float> motion [[texture(0)]]) {\n"
+        "    float2 texel = 1.0 / float2(motion.get_width(), motion.get_height());\n"
+        "    float4 total = float4(0.0);\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) total += motion.sample(exact, in.uv + float2(x, y) * texel);\n"
+        "    return total / 9.0;\n"
+        "}\n"
+        "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
+        "                     texture2d<float> chosen [[texture(2)]], texture2d<float> forward [[texture(3)]],\n"
+        "                     texture2d<float> backward [[texture(4)]], constant float &pixelsPerCell [[buffer(0)]]) {\n"
+        "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
+        "    float2 motion = chosen.sample(smooth, in.uv).rg;\n"
+        "    float2 fromFirst = in.uv - 0.5 * motion, fromSecond = in.uv + 0.5 * motion;\n"
+        // A source whose own flow disagrees with the motion is hidden or new in that frame, so the other one counts more.
+        "    float2 firstError = (forward.sample(smooth, fromFirst).rg * cell - motion) / cell * pixelsPerCell;\n"
+        "    float2 secondError = (-backward.sample(smooth, fromSecond).rg * cell - motion) / cell * pixelsPerCell;\n"
+        "    float firstWeight = 1.0 / (1.0 + 0.1 * dot(firstError, firstError)), secondWeight = 1.0 / (1.0 + 0.1 * dot(secondError, secondError));\n"
         "    if (any(fromFirst < 0.0) || any(fromFirst > 1.0)) firstWeight *= 0.001;\n"
         "    if (any(fromSecond < 0.0) || any(fromSecond > 1.0)) secondWeight *= 0.001;\n"
-        "    return (firstWeight * first.sample(s, fromFirst) + secondWeight * second.sample(s, fromSecond)) / (firstWeight + secondWeight);\n"
+        "    return (firstWeight * first.sample(smooth, fromFirst) + secondWeight * second.sample(smooth, fromSecond)) / (firstWeight + secondWeight);\n"
         "}\n";
     id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"fullscreen"];
-    descriptor.fragmentFunction = [library newFunctionWithName:@"warp"];
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
-    _warpLumaPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRG8Unorm;
-    _warpChromaPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
-    if (!_warpLumaPipeline || !_warpChromaPipeline) {
+    NSArray *stages = @[@[@"shrink", @(MTLPixelFormatR8Unorm)], @[@"choose", @(MTLPixelFormatRG16Float)], @[@"soften", @(MTLPixelFormatRG16Float)],
+                        @[@"warp", @(MTLPixelFormatR8Unorm)], @[@"warp", @(MTLPixelFormatRG8Unorm)]];
+    NSMutableArray<id<MTLRenderPipelineState>> *pipelines = [NSMutableArray array];
+    for (NSArray *stage in stages) {
+        descriptor.fragmentFunction = [library newFunctionWithName:stage[0]];
+        descriptor.colorAttachments[0].pixelFormat = [stage[1] unsignedIntegerValue];
+        id<MTLRenderPipelineState> pipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+        if (pipeline) [pipelines addObject:pipeline];
+    }
+    if (pipelines.count != stages.count) {
         fprintf(stderr, "smooth: cannot set up the flow warp: %s\n", error.localizedDescription.UTF8String);
         [flow endSession];
         return;
     }
+    _shrinkPipeline = pipelines[0];
+    _choosePipeline = pipelines[1];
+    _softenPipeline = pipelines[2];
+    _warpLumaPipeline = pipelines[3];
+    _warpChromaPipeline = pipelines[4];
     NSDictionary *field = config.destinationPixelBufferAttributes;
     _flowInputFormat = config.frameSupportedPixelFormats.firstObject.unsignedIntValue;
     _flowInputPool = NewPlainPool(_flowInputFormat, kFlowWidth, kFlowHeight);
@@ -266,14 +318,31 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
             id<MTLTexture> forwardTexture = [self texture:forward plane:0 format:MTLPixelFormatRG16Float keep:keep];
             id<MTLTexture> backwardTexture = [self texture:backward plane:0 format:MTLPixelFormatRG16Float keep:keep];
             id<MTLCommandBuffer> commands = [_commands commandBuffer];
-            BOOL drawn = forwardTexture && backwardTexture;
+            if (!_chosen || _chosen.width != width / 4 || _chosen.height != height / 4) {
+                MTLTextureDescriptor *small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:width / 4 height:height / 4 mipmapped:NO];
+                small.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                small.storageMode = MTLStorageModePrivate;
+                _quarterFirst = [_device newTextureWithDescriptor:small];
+                _quarterSecond = [_device newTextureWithDescriptor:small];
+                small.pixelFormat = MTLPixelFormatRG16Float;
+                _chosen = [_device newTextureWithDescriptor:small];
+                _softened = [_device newTextureWithDescriptor:small];
+            }
+            BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _chosen && _softened;
             for (size_t plane = 0; plane < 2 && drawn; plane++) {
                 MTLPixelFormat planeFormat = plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm;
                 id<MTLTexture> first = [self texture:previous plane:plane format:planeFormat keep:keep];
                 id<MTLTexture> second = [self texture:current plane:plane format:planeFormat keep:keep];
                 id<MTLTexture> target = [self texture:destination plane:plane format:planeFormat keep:keep];
                 drawn = first && second && target;
-                if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target from:@[first, second, forwardTexture, backwardTexture]
+                if (drawn && plane == 0) {
+                    [self draw:_shrinkPipeline into:_quarterFirst from:@[first] value:0 commands:commands];
+                    [self draw:_shrinkPipeline into:_quarterSecond from:@[second] value:0 commands:commands];
+                    [self draw:_choosePipeline into:_chosen from:@[_quarterFirst, _quarterSecond, forwardTexture, backwardTexture] value:0 commands:commands];
+                    [self draw:_softenPipeline into:_softened from:@[_chosen] value:0 commands:commands];
+                }
+                if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target
+                                 from:@[first, second, _softened, forwardTexture, backwardTexture]
                                 value:(float)width / (float)forwardTexture.width commands:commands];
             }
             if (drawn) {
