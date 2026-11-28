@@ -198,22 +198,26 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         // The flow field is coarse and blends motions where a limb crosses the background, which doubled outlines. Each
         // point instead takes, from the motions of the nearby flow cells and no motion at all (overlays), the best match.
         "fragment float4 choose(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
-        "                       texture2d<float> forward [[texture(2)]], texture2d<float> backward [[texture(3)]]) {\n"
+        "                       texture2d<float> forward [[texture(2)]], texture2d<float> backward [[texture(3)]],\n"
+        "                       constant float &pixelsPerCell [[buffer(0)]]) {\n"
         "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
-        "    float2 best = forward.sample(smooth, in.uv).rg * cell;\n"
+        "    float2 here = forward.sample(smooth, in.uv).rg * cell, there = -backward.sample(smooth, in.uv).rg * cell;\n"
+        "    float2 best = here;\n"
         "    float bestError = mismatch(first, second, in.uv, best);\n"
-        "    float2 motion = -backward.sample(smooth, in.uv).rg * cell;\n"
-        "    float error = mismatch(first, second, in.uv, motion);\n"
+        "    float error = mismatch(first, second, in.uv, there);\n"
+        "    if (error < bestError) { bestError = error; best = there; }\n"
+        // A thin trunk crossing plain sky matches perfectly with the sky's motion too, which punched holes in it, so a
+        // motion pays up to 8 luma levels a tap for departing (by up to 8 pixels) from the flow measured at the point.
+        "    float2 toPixels = pixelsPerCell / cell;\n"
+        "    float2 motion = float2(0.0);\n"
+        "    error = mismatch(first, second, in.uv, motion)\n"
+        "          + 72.0 / 255.0 * min(min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels)), 8.0) / 8.0;\n"
         "    if (error < bestError) { bestError = error; best = motion; }\n"
-        "    error = mismatch(first, second, in.uv, float2(0.0));\n"
-        "    if (error < bestError) { bestError = error; best = float2(0.0); }\n"
-        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) for (int side = 0; side < 2; side++) {\n"
         "        float2 at = in.uv + float2(x, y) * cell;\n"
-        "        motion = forward.sample(exact, at).rg * cell;\n"
-        "        error = mismatch(first, second, in.uv, motion);\n"
-        "        if (error < bestError) { bestError = error; best = motion; }\n"
-        "        motion = -backward.sample(exact, at).rg * cell;\n"
-        "        error = mismatch(first, second, in.uv, motion);\n"
+        "        motion = side == 0 ? forward.sample(exact, at).rg * cell : -backward.sample(exact, at).rg * cell;\n"
+        "        error = mismatch(first, second, in.uv, motion)\n"
+        "              + 72.0 / 255.0 * min(min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels)), 8.0) / 8.0;\n"
         "        if (error < bestError) { bestError = error; best = motion; }\n"
         "    }\n"
         "    return float4(best, 0.0, 1.0);\n"
@@ -376,7 +380,8 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                 if (drawn && plane == 0) {
                     [self draw:_shrinkPipeline into:_quarterFirst from:@[first] value:0 commands:commands];
                     [self draw:_shrinkPipeline into:_quarterSecond from:@[second] value:0 commands:commands];
-                    [self draw:_choosePipeline into:_chosen from:@[_quarterFirst, _quarterSecond, forwardTexture, backwardTexture] value:0 commands:commands];
+                    [self draw:_choosePipeline into:_chosen from:@[_quarterFirst, _quarterSecond, forwardTexture, backwardTexture]
+                         value:(float)width / (float)forwardTexture.width commands:commands];
                     [self draw:_settlePipeline into:_settled from:@[_chosen] value:0 commands:commands];
                 }
                 if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target
