@@ -185,21 +185,26 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    return 0.25 * (image.sample(smooth, in.uv + texel * float2(-1, -1)) + image.sample(smooth, in.uv + texel * float2(1, -1))\n"
         "                 + image.sample(smooth, in.uv + texel * float2(-1, 1)) + image.sample(smooth, in.uv + texel * float2(1, 1)));\n"
         "}\n"
-        // How unlike the two real frames are at the two ends of a motion through this point, over a 3x3 grid of taps.
-        "static float mismatch(texture2d<float> first, texture2d<float> second, float2 uv, float2 motion) {\n"
-        "    float2 texel = 2.0 / float2(first.get_width(), first.get_height());\n"
-        "    float total = 0.0;\n"
-        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
-        "        float2 at = uv + float2(x, y) * texel;\n"
-        "        total += abs(first.sample(smooth, at - 0.5 * motion).r - second.sample(smooth, at + 0.5 * motion).r);\n"
-        "    }\n"
-        "    return total;\n"
-        "}\n"
-        // A thin trunk crossing plain sky matches perfectly with "no motion" too, which punched holes in it, so a motion
-        // pays up to 8 luma levels a tap for departing (by up to 8 pixels) from the flow measured at the point.
+        // What a motion through this point costs: how unlike the two real frames are at its two ends over a 3x3 grid of
+        // taps, plus up to 8 luma levels a tap for departing (by up to 8 pixels) from the flow measured here, less up to
+        // 20 levels a tap for structure at both ends. Sky matches sky and a plain panel matches itself under almost any
+        // motion; without the last two terms such matches punched holes in thin trunks and erased overlay icons.
         "static float price(texture2d<float> first, texture2d<float> second, float2 uv, float2 motion, float2 here, float2 there, float2 toPixels) {\n"
+        "    float2 texel = 2.0 / float2(first.get_width(), first.get_height());\n"
+        "    float before[9], after[9];\n"
+        "    float unlike = 0.0, beforeMean = 0.0, afterMean = 0.0;\n"
+        "    for (int i = 0; i < 9; i++) {\n"
+        "        float2 at = uv + float2(i % 3 - 1, i / 3 - 1) * texel;\n"
+        "        before[i] = first.sample(smooth, at - 0.5 * motion).r;\n"
+        "        after[i] = second.sample(smooth, at + 0.5 * motion).r;\n"
+        "        unlike += abs(before[i] - after[i]);\n"
+        "        beforeMean += before[i] / 9.0;\n"
+        "        afterMean += after[i] / 9.0;\n"
+        "    }\n"
+        "    float beforeStructure = 0.0, afterStructure = 0.0;\n"
+        "    for (int i = 0; i < 9; i++) { beforeStructure += abs(before[i] - beforeMean) / 9.0; afterStructure += abs(after[i] - afterMean) / 9.0; }\n"
         "    float departure = min(distance(motion * toPixels, here * toPixels), distance(motion * toPixels, there * toPixels));\n"
-        "    return mismatch(first, second, uv, motion) + 72.0 / 255.0 * min(departure, 8.0) / 8.0;\n"
+        "    return unlike + 72.0 / 255.0 * min(departure, 8.0) / 8.0 - 4.5 * min(min(beforeStructure, afterStructure), 40.0 / 255.0);\n"
         "}\n"
         // The flow field is coarse and blends motions where a limb crosses the background, which doubled outlines. Each
         // point instead takes, from the motions of the nearby flow cells and no motion at all (overlays), the best match.
