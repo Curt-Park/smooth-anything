@@ -2,6 +2,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #import "smooth.h"
 
@@ -57,16 +58,24 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commands;
     CVMetalTextureCacheRef _textures, _presentTextures;
-    id<MTLRenderPipelineState> _presentPipeline;
+    id<MTLRenderPipelineState> _presentPipeline, _sharpenPipeline;
     CAMetalLayer *_layer;
     NSObject *_presentLock;
+    id<MTLFXSpatialScaler> _upscaler;
+    id<MTLTexture> _converted, _upscaled;
+    BOOL _upscale;
+    float _sharpen;
+    size_t _viewPixelWidth, _viewPixelHeight;
+    double _presentSum;
+    int _presentCount;
 
     NSWindow *_host;
     NSPanel *_child;
     BOOL _attached, _hidden;
 
     NSMutableArray *_pending;
-    int _shown, _missed;
+    int _shown, _missed, _dropped, _shifts, _lastOffset;
+    int _glass[4];
     double _slotVsync, _period;
     BOOL _slotFilled;
 
@@ -103,6 +112,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _wantFull = getenv("SMOOTH_INTERP_720") == NULL;
     _fastAbove = getenv("SMOOTH_FAST_ABOVE") ? atof(getenv("SMOOTH_FAST_ABOVE")) : 12.0;
+    _upscale = !getenv("SMOOTH_UPSCALE") || atoi(getenv("SMOOTH_UPSCALE")) != 0;
+    _sharpen = getenv("SMOOTH_SHARPEN") ? fminf(fmaxf(atof(getenv("SMOOTH_SHARPEN")), 0), 1) : 0.7f;
     if (getenv("SMOOTH_DUMP")) {
         _dumpDirectory = @(getenv("SMOOTH_DUMP"));
         _dumpQueue = dispatch_queue_create("smooth.dump", DISPATCH_QUEUE_SERIAL);
@@ -335,7 +346,22 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
             [child setFrame:[host convertRectToScreen:host.contentLayoutRect] display:YES];
         }];
     }
+    for (NSNotificationName name in @[NSWindowDidResizeNotification, NSWindowDidChangeBackingPropertiesNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:child queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            [self updateOutputSize];
+        }];
+    }
     [self startOutputIn:view];
+    [self updateOutputSize];
+}
+
+- (void)updateOutputSize {
+    CGFloat scale = _child.backingScaleFactor;
+    NSSize size = _child.contentView.bounds.size;
+    @synchronized (_presentLock) {
+        _viewPixelWidth = (size_t)lround(size.width * scale);
+        _viewPixelHeight = (size_t)lround(size.height * scale);
+    }
 }
 
 - (void)startOutputIn:(NSView *)view {
@@ -352,6 +378,19 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
         "    float2 c = chroma.sample(s, in.uv).rg - 0.5;\n"
         "    if (fullRange < 0.5) { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }\n"
         "    return float4(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x, 1.0);\n"
+        "}\n"
+        // Contrast-adaptive sharpening (after AMD CAS): flat and already-contrasty pixels get less, so edges do not ring.
+        "fragment float4 sharpen(Out in [[stage_in]], texture2d<float> image [[texture(0)]], constant float &strength [[buffer(0)]]) {\n"
+        "    uint2 p = uint2(in.position.xy), last = uint2(image.get_width() - 1, image.get_height() - 1);\n"
+        "    float3 center = image.read(p).rgb;\n"
+        "    if (strength <= 0.0) return float4(center, 1.0);\n"
+        "    float3 up = image.read(uint2(p.x, p.y > 0 ? p.y - 1 : 0)).rgb, down = image.read(uint2(p.x, min(p.y + 1, last.y))).rgb;\n"
+        "    float3 left = image.read(uint2(p.x > 0 ? p.x - 1 : 0, p.y)).rgb, right = image.read(uint2(min(p.x + 1, last.x), p.y)).rgb;\n"
+        "    float3 low = min(center, min(min(up, down), min(left, right)));\n"
+        "    float3 high = max(center, max(max(up, down), max(left, right)));\n"
+        "    float3 amount = sqrt(saturate(min(low, 1.0 - high) / max(high, 1e-4)));\n"
+        "    float3 weight = amount * (-1.0 / mix(8.0, 5.0, strength));\n"
+        "    return float4(saturate(((up + down + left + right) * weight + center) / (1.0 + 4.0 * weight)), 1.0);\n"
         "}\n";
     NSError *error = nil;
     id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
@@ -361,6 +400,9 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     _presentPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
     if (!_presentPipeline) { fprintf(stderr, "smooth: cannot set up the output: %s\n", error.localizedDescription.UTF8String); return; }
+    descriptor.fragmentFunction = [library newFunctionWithName:@"sharpen"];
+    _sharpenPipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (!_sharpenPipeline) _upscale = NO;
 
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.device = _device;
@@ -483,13 +525,66 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     if (next) [self present:next];
 }
 
+// Fits the frame into the view's pixels; returns NO when MetalFX is off or would not enlarge the frame.
+- (BOOL)prepareUpscaleWidth:(size_t)width height:(size_t)height output:(CGSize *)output {
+    if (!_upscale || !_viewPixelWidth || !_viewPixelHeight) return NO;
+    size_t fitWidth = _viewPixelWidth, fitHeight = _viewPixelWidth * height / width;
+    if (fitHeight > _viewPixelHeight) { fitHeight = _viewPixelHeight; fitWidth = _viewPixelHeight * width / height; }
+    if (fitWidth <= width || fitHeight <= height) return NO;
+    // Past 2x MetalFX adds no detail, and at a 6016-pixel-wide backing it took 8–13 ms a frame next to the interpolator.
+    if (fitWidth > 2 * width) { fitWidth = 2 * width; fitHeight = 2 * height; }
+    *output = CGSizeMake(fitWidth, fitHeight);
+    if (_upscaler && _upscaler.inputWidth == width && _upscaler.inputHeight == height
+        && _upscaler.outputWidth == fitWidth && _upscaler.outputHeight == fitHeight) return YES;
+    MTLFXSpatialScalerDescriptor *descriptor = [MTLFXSpatialScalerDescriptor new];
+    descriptor.inputWidth = width;
+    descriptor.inputHeight = height;
+    descriptor.outputWidth = fitWidth;
+    descriptor.outputHeight = fitHeight;
+    descriptor.colorTextureFormat = MTLPixelFormatBGRA8Unorm;
+    descriptor.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+    descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+    _upscaler = [descriptor newSpatialScalerWithDevice:_device];
+    if (!_upscaler) {
+        fprintf(stderr, "smooth: MetalFX cannot scale %zux%zu to %zux%zu, using plain scaling\n", width, height, fitWidth, fitHeight);
+        _upscale = NO;
+        return NO;
+    }
+    MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
+    texture.usage = _upscaler.colorTextureUsage | MTLTextureUsageRenderTarget;
+    texture.storageMode = MTLStorageModePrivate;
+    _converted = [_device newTextureWithDescriptor:texture];
+    texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:fitWidth height:fitHeight mipmapped:NO];
+    texture.usage = _upscaler.outputTextureUsage | MTLTextureUsageShaderRead;
+    texture.storageMode = MTLStorageModePrivate;
+    _upscaled = [_device newTextureWithDescriptor:texture];
+    if (_debug) fprintf(stderr, "smooth: MetalFX scaling %zux%zu to %zux%zu, sharpen %.2f\n", width, height, fitWidth, fitHeight, _sharpen);
+    return YES;
+}
+
+- (void)draw:(id<MTLRenderPipelineState>)pipeline into:(id<MTLTexture>)target from:(NSArray<id<MTLTexture>> *)sources
+       value:(float)value commands:(id<MTLCommandBuffer>)commands {
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
+    [encoder setRenderPipelineState:pipeline];
+    for (NSUInteger index = 0; index < sources.count; index++) [encoder setFragmentTexture:sources[index] atIndex:index];
+    [encoder setFragmentBytes:&value length:sizeof(value) atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+}
+
 - (void)present:(NSArray *)item {
     @synchronized (_presentLock) {
         if (!_layer) return;
         CVPixelBufferRef buffer = (__bridge CVPixelBufferRef)item[0];
         size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
         if (!CVPixelBufferIsPlanar(buffer)) return;
-        if (_layer.drawableSize.width != width || _layer.drawableSize.height != height) _layer.drawableSize = CGSizeMake(width, height);
+        CGSize output = CGSizeMake(width, height);
+        BOOL upscale = [self prepareUpscaleWidth:width height:height output:&output];
+        if (!CGSizeEqualToSize(_layer.drawableSize, output)) _layer.drawableSize = output;
         CVMetalTextureRef luma = NULL, chroma = NULL;
         CVMetalTextureCacheCreateTextureFromImage(NULL, _presentTextures, buffer, NULL, MTLPixelFormatR8Unorm, width, height, 0, &luma);
         CVMetalTextureCacheCreateTextureFromImage(NULL, _presentTextures, buffer, NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, &chroma);
@@ -499,21 +594,40 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
             if (chroma) CFRelease(chroma);
             return;
         }
-        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        double target = [item[1] doubleValue];
+        [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+            double presented = shown.presentedTime;
+            @synchronized (self->_pending) {
+                if (presented == 0) { self->_dropped++; return; }
+                // A steady offset is compositor latency; judder is the offset changing between frames.
+                int offset = (int)MAX(0, MIN(3, lround((presented - target) / self->_period)));
+                self->_glass[offset]++;
+                if (offset != self->_lastOffset) self->_shifts++;
+                self->_lastOffset = offset;
+            }
+        }];
         id<MTLCommandBuffer> commands = [_commands commandBuffer];
-        id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
         float fullRange = CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0;
-        [encoder setRenderPipelineState:_presentPipeline];
-        [encoder setFragmentTexture:CVMetalTextureGetTexture(luma) atIndex:0];
-        [encoder setFragmentTexture:CVMetalTextureGetTexture(chroma) atIndex:1];
-        [encoder setFragmentBytes:&fullRange length:sizeof(fullRange) atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        [encoder endEncoding];
+        NSArray *planes = @[CVMetalTextureGetTexture(luma), CVMetalTextureGetTexture(chroma)];
+        if (upscale) {
+            [self draw:_presentPipeline into:_converted from:planes value:fullRange commands:commands];
+            _upscaler.colorTexture = _converted;
+            _upscaler.outputTexture = _upscaled;
+            _upscaler.inputContentWidth = width;
+            _upscaler.inputContentHeight = height;
+            [_upscaler encodeToCommandBuffer:commands];
+            [self draw:_sharpenPipeline into:drawable.texture from:@[_upscaled] value:_sharpen commands:commands];
+        } else {
+            [self draw:_presentPipeline into:drawable.texture from:planes value:fullRange commands:commands];
+        }
         [commands presentDrawable:drawable];
-        [commands addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)item; CFRelease(luma); CFRelease(chroma); }];
+        [commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)item;
+            CFRelease(luma);
+            CFRelease(chroma);
+            double took = done.GPUEndTime - done.GPUStartTime;
+            @synchronized (self->_pending) { self->_presentSum += took; self->_presentCount++; }
+        }];
         [commands commit];
     }
 }
@@ -616,15 +730,28 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     double elapsed = received - _statsStart;
     if (elapsed < 2.0) return;
     if (_debug) {
-        int shown, missed;
-        @synchronized (_pending) { shown = _shown; missed = _missed; _shown = _missed = 0; }
+        int shown, missed, dropped, shifts, glass[4];
+        double present;
+        @synchronized (_pending) {
+            shown = _shown;
+            missed = _missed;
+            dropped = _dropped;
+            shifts = _shifts;
+            memcpy(glass, _glass, sizeof(glass));
+            memset(_glass, 0, sizeof(_glass));
+            present = _presentCount ? _presentSum / _presentCount : 0;
+            _shown = _missed = _dropped = _shifts = _presentCount = 0;
+            _presentSum = 0;
+        }
         fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d, fast %d | "
-                "interp %.1f ms, upscale %.1f ms | delay %.1f ms\n",
+                "on glass +0/+1/+2/+3 %d/%d/%d/%d, shifts %d, dropped %d | "
+                "interp %.1f ms, upscale %.1f ms, present %.1f ms GPU | delay %.1f ms\n",
                 _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts, _fastMiddles,
-                _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0,
+                glass[0], glass[1], glass[2], glass[3], shifts, dropped,
+                _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0, present * 1000,
                 _delayCount ? _delaySum / _delayCount * 1000 : 0);
     } else {
-        @synchronized (_pending) { _shown = _missed = 0; }
+        @synchronized (_pending) { _shown = _missed = _dropped = _shifts = _presentCount = 0; _presentSum = 0; memset(_glass, 0, sizeof(_glass)); }
     }
     _statsStart = received;
     _received = _unique = _interpolated = _scaled = _cuts = _holds = _skipped = _delayCount = _fastMiddles = 0;

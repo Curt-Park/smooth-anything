@@ -4,7 +4,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/chiaki-ng"
 [ -f "$SRC/CMakeLists.txt" ] || git -C "$HERE" submodule update --init --recursive
 cd "$SRC"
-if git apply --check "$HERE/smooth-hook.patch" 2>/dev/null; then git apply "$HERE/smooth-hook.patch"; fi
+# An older version of the patch may be applied: restore the files it touches, then apply the current one.
+if ! git apply --reverse --check "$HERE/smooth-hook.patch" 2>/dev/null; then
+  git checkout -- $(git apply --numstat "$HERE/smooth-hook.patch" | cut -f3)
+  git apply "$HERE/smooth-hook.patch"
+fi
 [ -d build-venv ] || { python3 -m venv build-venv && ./build-venv/bin/pip install -q "protobuf>=5,<6" setuptools; }
 P="$(brew --prefix)"
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHIAKI_ENABLE_CLI=OFF -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF \

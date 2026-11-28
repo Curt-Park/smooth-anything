@@ -23,7 +23,7 @@ index 7e777e1f..adf7c37d 100755
 +	target_include_directories(chiaki PRIVATE ${SMOOTH_ANYTHING_DIR})
 +	target_compile_definitions(chiaki PRIVATE CHIAKI_SMOOTH_ANYTHING)
 +	target_link_libraries(chiaki "-framework VideoToolbox" "-framework Metal" "-framework CoreMedia" "-framework CoreVideo"
-+		"-framework QuartzCore" "-framework Cocoa")
++		"-framework QuartzCore" "-framework Cocoa" "-framework MetalFX")
 +endif()
 +
  # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")

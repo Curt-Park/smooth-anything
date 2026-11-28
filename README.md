@@ -34,7 +34,8 @@ git submodule update --init --recursive
 ./run.sh
 ```
 
-`build.sh` applies `smooth-hook.patch` to the chiaki-ng submodule (v1.10.1) and builds it.
+`build.sh` applies `smooth-hook.patch` to the chiaki-ng submodule (v1.10.1), replacing an older
+version of the patch if one is applied, and builds it.
 `run.sh` starts it with the Vulkan loader set and passes arguments on. To check what really reaches
 the screen, run `./verify --match pid:<chiaki pid>` (needs Screen Recording permission).
 `./package.sh <version>` builds the self-contained app, its DMG and a source archive with chiaki-ng
@@ -58,7 +59,11 @@ in `dist/`.
 4. **Schedule** the middle frame and the untouched real frame on consecutive display refreshes.
 5. **Present** through a Metal layer in a child window over chiaki-ng, driven by a display link and
    synced to the display refresh. Unsynced, a full-screen picture changed mid-scan and tore along a
-   fixed line during camera moves.
+   fixed line during camera moves. Every frame, real or generated, is upscaled to the window's pixels
+   with MetalFX spatial scaling and then given contrast-adaptive sharpening; Core Animation's
+   bilinear stretch of the 1080p frame looked soft. The upscale stops at 2x: on a 3008x1692
+   ("looks like") 4K monitor the full 6016-pixel backing took 10–14 ms of GPU time a frame next to the
+   interpolator, against about 5 ms at 2x, and looked the same.
 
 The added delay is about 55–70 ms after a frame is decoded.
 
@@ -72,6 +77,8 @@ downloaded app.
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
 | `SMOOTH_FAST_ABOVE=<mean>` | Mean frame difference (as `SMOOTH_DIFF` prints it) above which a camera move counts as fast and gets the quarter-way 720p middle; it ends below three quarters of the value. Default 12; a large value such as 1000 turns it off |
-| `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds |
+| `SMOOTH_UPSCALE=0` | Let Core Animation stretch the frame instead of MetalFX upscaling and sharpening |
+| `SMOOTH_SHARPEN=<0–1>` | Sharpening strength after the MetalFX upscale. Default 0.7; 0 turns it off |
+| `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder) |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |
 | `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison |
