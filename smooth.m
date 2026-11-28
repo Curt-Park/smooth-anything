@@ -235,9 +235,12 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "}\n"
         "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
         "                     texture2d<float> chosen [[texture(2)]], texture2d<float> forward [[texture(3)]],\n"
-        "                     texture2d<float> backward [[texture(4)]], constant float &pixelsPerCell [[buffer(0)]]) {\n"
+        "                     texture2d<float> backward [[texture(4)]], texture2d<float> firstLuma [[texture(5)]],\n"
+        "                     texture2d<float> secondLuma [[texture(6)]], constant float &pixelsPerCell [[buffer(0)]]) {\n"
         "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
-        // Blends the motion between the four chosen points around this pixel only where they agree within 2 pixels.
+        // Blends the motion between the four chosen points around this pixel only where they agree within 2 pixels. Where
+        // they do not, the nearest point's motion left 4-pixel steps along outlines, so the pixel takes whichever of the
+        // four matches the two real frames best around it, at full size.
         "    float2 size = float2(chosen.get_width(), chosen.get_height());\n"
         "    float2 place = in.uv * size - 0.5, corner = floor(place), part = place - corner;\n"
         "    float2 limit = size - 1.0;\n"
@@ -247,7 +250,21 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
         "    float2 toPixels = pixelsPerCell / cell;\n"
         "    float spread = max(max(distance(m00 * toPixels, motion * toPixels), distance(m10 * toPixels, motion * toPixels)),\n"
         "                       max(distance(m01 * toPixels, motion * toPixels), distance(m11 * toPixels, motion * toPixels)));\n"
-        "    if (spread < 2.0) motion = mix(mix(m00, m10, part.x), mix(m01, m11, part.x), part.y);\n"
+        "    if (spread < 2.0) {\n"
+        "        motion = mix(mix(m00, m10, part.x), mix(m01, m11, part.x), part.y);\n"
+        "    } else {\n"
+        "        float2 nearest = motion, options[4] = {m00, m10, m01, m11};\n"
+        "        float2 texel = 1.0 / float2(firstLuma.get_width(), firstLuma.get_height());\n"
+        "        float bestError = 1e9;\n"
+        "        for (int i = 0; i < 4; i++) {\n"
+        "            float error = all(options[i] == nearest) ? 0.0 : 9.0 / 255.0;\n"
+        "            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "                float2 at = in.uv + float2(x, y) * texel;\n"
+        "                error += abs(firstLuma.sample(smooth, at - 0.5 * options[i]).r - secondLuma.sample(smooth, at + 0.5 * options[i]).r);\n"
+        "            }\n"
+        "            if (error < bestError) { bestError = error; motion = options[i]; }\n"
+        "        }\n"
+        "    }\n"
         "    float2 fromFirst = in.uv - 0.5 * motion, fromSecond = in.uv + 0.5 * motion;\n"
         // A source whose own flow disagrees with the motion is hidden or new in that frame, so the other one counts more.
         "    float2 firstError = (forward.sample(smooth, fromFirst).rg * cell - motion) / cell * pixelsPerCell;\n"
@@ -347,6 +364,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                 _chosen = [_device newTextureWithDescriptor:small];
                 _settled = [_device newTextureWithDescriptor:small];
             }
+            id<MTLTexture> firstLuma = nil, secondLuma = nil;
             BOOL drawn = forwardTexture && backwardTexture && _quarterFirst && _quarterSecond && _chosen && _settled;
             for (size_t plane = 0; plane < 2 && drawn; plane++) {
                 MTLPixelFormat planeFormat = plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm;
@@ -354,6 +372,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                 id<MTLTexture> second = [self texture:current plane:plane format:planeFormat keep:keep];
                 id<MTLTexture> target = [self texture:destination plane:plane format:planeFormat keep:keep];
                 drawn = first && second && target;
+                if (plane == 0) { firstLuma = first; secondLuma = second; }
                 if (drawn && plane == 0) {
                     [self draw:_shrinkPipeline into:_quarterFirst from:@[first] value:0 commands:commands];
                     [self draw:_shrinkPipeline into:_quarterSecond from:@[second] value:0 commands:commands];
@@ -361,7 +380,7 @@ static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t hei
                     [self draw:_settlePipeline into:_settled from:@[_chosen] value:0 commands:commands];
                 }
                 if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target
-                                 from:@[first, second, _settled, forwardTexture, backwardTexture]
+                                 from:@[first, second, _settled, forwardTexture, backwardTexture, firstLuma, secondLuma]
                                 value:(float)width / (float)forwardTexture.width commands:commands];
             }
             if (drawn) {
