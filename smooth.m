@@ -79,6 +79,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     double _lastNewMean, _lastRepeatMean, _lastNewTime, _motionLevel;
     BOOL _sceneCut;
     CVPixelBufferRef _restFrame, _restNative;
+    BOOL _restLarge;
     double _restTime;
     NSUInteger _generation;
 
@@ -606,7 +607,9 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
 - (void)showRest {
     if (!_restFrame) return;
     double target = MAX(_lastTarget + _period, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-    [self show:_restNative target:target];
+    CVPixelBufferRef restOut = [self finished:_restNative large:_restLarge];
+    [self show:restOut target:target];
+    CVPixelBufferRelease(restOut);
     _lastTarget = target;
     CVPixelBufferRelease(_previousFrame);
     _previousFrame = _restFrame;
@@ -625,9 +628,16 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     CVPixelBufferRelease(_restNative);
     _restNative = NULL;
 
+    // At 1280x720 a middle frame keeps about half a native frame's fine detail, and alternating the two flickers,
+    // so real frames take the same 1280x720 and super resolution route as the middles.
+    BOOL large = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2;
+    BOOL matched = large && !_fullPool && _scaler;
+    CVPixelBufferRef real = matched ? small : native;
+
     if ([self isDuplicate:small received:received]) {
         _restFrame = CVPixelBufferRetain(input);
-        _restNative = CVPixelBufferRetain(native);
+        _restNative = CVPixelBufferRetain(real);
+        _restLarge = matched;
         _restTime = received;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), _queue, ^{
             if (self->_generation == generation) [self showRest];
@@ -651,11 +661,11 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
             }
             if (middle) {
                 _interpolated++;
-                BOOL large = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2;
                 middleOut = [self finished:middle large:large];
                 CVPixelBufferRelease(middle);
             }
         }
+        CVPixelBufferRef realOut = [self finished:real large:matched];
 
         double afterPrevious = _lastTarget + step;
         double earliest = [self refreshAtOrAfter:HostNow() + kCommitLead];
@@ -673,7 +683,8 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
             first += step;
         }
         first = MAX(first, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-        [self show:native target:first];
+        [self show:realOut target:first];
+        CVPixelBufferRelease(realOut);
         _lastTarget = first;
         _delaySum += first - received;
         _delayCount++;

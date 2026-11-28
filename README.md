@@ -48,7 +48,9 @@ in `dist/`.
    recognised by its small difference from the first.
 3. **Interpolate** the midpoint of two game frames with `VTLowLatencyFrameInterpolation` at 1080p.
    If a warm-up call takes over 25 ms, it uses 720p and upscales the result with
-   `VTLowLatencySuperResolutionScaler`. Scene cuts get no middle frame, and neither does a frame that
+   `VTLowLatencySuperResolutionScaler`. Real frames then take the same 720p and upscale route: a
+   720p middle keeps about half the fine detail of a native 1080p frame, and alternating the two
+   every refresh flickered. Scene cuts get no middle frame, and neither does a frame that
    arrives too soon after the previous one for a refresh to fit between them (menus, near-still
    pictures whose copies all read as new); otherwise such frames booked two refreshes each and the
    delay grew past 200 ms.
@@ -71,7 +73,7 @@ downloaded app.
 | Variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
-| `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
+| `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p (real frames are then shown at the same 720p, upscaled) |
 | `SMOOTH_UPSCALE=0` | Let Core Animation stretch the frame instead of MetalFX upscaling and sharpening |
 | `SMOOTH_SHARPEN=<0–1>` | Sharpening strength after the MetalFX upscale. Default 0.7; 0 turns it off |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder) |
