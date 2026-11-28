@@ -47,7 +47,11 @@ in `dist/`.
    recognised by its small difference from the first.
 3. **Interpolate** the midpoint of two game frames with `VTLowLatencyFrameInterpolation` at 1080p.
    If a warm-up call takes over 25 ms, it uses 720p and upscales the result with
-   `VTLowLatencySuperResolutionScaler`. Scene cuts get no middle frame, and neither does a frame that
+   `VTLowLatencySuperResolutionScaler`. During fast camera moves it instead interpolates at 720p a
+   quarter of the way from the earlier frame and upscales: at the midpoint, the background swept past
+   a character the camera circles smeared into the character's outline, and a quarter-way frame,
+   closer to a real one, narrows that smear. A Mac that cannot do this within 25 ms keeps the
+   midpoint. Scene cuts get no middle frame, and neither does a frame that
    arrives too soon after the previous one for a refresh to fit between them (menus, near-still
    pictures whose copies all read as new); otherwise such frames booked two refreshes each and the
    delay grew past 200 ms.
@@ -67,6 +71,7 @@ downloaded app.
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
+| `SMOOTH_FAST_ABOVE=<mean>` | Mean frame difference (as `SMOOTH_DIFF` prints it) above which a camera move counts as fast and gets the quarter-way 720p middle; it ends below three quarters of the value. Default 12; a large value such as 1000 turns it off |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |
 | `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison |

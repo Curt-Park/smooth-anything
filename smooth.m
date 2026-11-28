@@ -12,6 +12,9 @@ static const double kFullCallLimit = 0.025;
 static const OSType kProcessFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 static const double kCommitLead = 0.013;
 static const double kRepeatRatio = 0.3;
+// A quarter-way middle narrows the background smear around a screen-fixed character; only 720p does it in a frame's time.
+static const float kFastPhase = 0.25f;
+static const double kFastCallLimit = 0.025;
 
 static double HostNow(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
 static CMTime HostTime(double seconds) { return CMTimeMakeWithSeconds(seconds, 1000000000); }
@@ -37,6 +40,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     dispatch_queue_t _queue;
     BOOL _debug, _debugDiff, _prepared, _wantFull;
     int _failed;
+
+    VTFrameProcessor *_fastProcessor;
+    CVPixelBufferPoolRef _fastPool;
+    double _fastAbove;
+    BOOL _fastReady, _fastMotion;
 
     VTFrameProcessor *_processor;
     CVPixelBufferPoolRef _middlePool;
@@ -81,7 +89,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     double _lastMean;
 
     double _statsStart, _interpSum, _scaleSum, _delaySum;
-    int _received, _unique, _interpolated, _scaled, _cuts, _holds, _skipped, _delayCount;
+    int _received, _unique, _interpolated, _scaled, _cuts, _holds, _skipped, _delayCount, _fastMiddles;
 }
 
 - (instancetype)init {
@@ -94,6 +102,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _wantFull = getenv("SMOOTH_INTERP_720") == NULL;
+    _fastAbove = getenv("SMOOTH_FAST_ABOVE") ? atof(getenv("SMOOTH_FAST_ABOVE")) : 12.0;
     if (getenv("SMOOTH_DUMP")) {
         _dumpDirectory = @(getenv("SMOOTH_DUMP"));
         _dumpQueue = dispatch_queue_create("smooth.dump", DISPATCH_QUEUE_SERIAL);
@@ -132,18 +141,19 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 }
 
 // Runs a few calls on blank frames so the first real ones are not slow, and returns the fastest warm call in seconds.
-- (double)warmUp {
-    CVPixelBufferPoolRef inputPool = _fullPool ?: _smallPool;
+- (double)warmUp:(BOOL)fast {
+    CVPixelBufferPoolRef inputPool = fast ? _smallPool : _fullPool ?: _smallPool;
     CVPixelBufferRef blankA = NULL, blankB = NULL;
     CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankA);
     CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankB);
     double fastest = 0;
     for (int round = 0; round < 3 && blankA && blankB; round++) {
         double begin = HostNow();
-        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30];
+        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30 fast:fast];
         double took = HostNow() - begin;
-        if (round > 0 && (fastest == 0 || took < fastest)) fastest = took;
         CVPixelBufferRef finished = [self finished:middle ?: blankB large:YES];
+        if (fast) took = HostNow() - begin;
+        if (round > 0 && (fastest == 0 || took < fastest)) fastest = took;
         CVPixelBufferRelease(finished);
         CVPixelBufferRelease(middle);
     }
@@ -174,34 +184,59 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     VTPixelTransferSessionCreate(NULL, &_transfer);
     _smallPool = NewPool(nil, kProcessWidth, kProcessHeight);
 
-    double call = [self warmUp];
+    double call = [self warmUp:NO];
     // A slower Mac (an M1 takes about 100 ms at 1080p) would miss nearly every middle frame, so it keeps 1280x720.
     if (_fullPool && call > kFullCallLimit) {
         fprintf(stderr, "smooth: interpolation at 1920x1080 takes %.0f ms on this Mac, using 1280x720\n", call * 1000);
         [self stopInterpolator];
         if (supported) [self startInterpolatorWidth:kProcessWidth height:kProcessHeight];
-        call = [self warmUp];
+        call = [self warmUp:NO];
     }
     if (_debug) fprintf(stderr, "smooth: interpolating at %s, %.1f ms a call\n", _fullPool ? "1920x1080" : "1280x720", call * 1000);
+
+    if (supported && _fullPool) {
+        VTLowLatencyFrameInterpolationConfiguration *config =
+            [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:kProcessWidth frameHeight:kProcessHeight numberOfInterpolatedFrames:1];
+        VTFrameProcessor *processor = [VTFrameProcessor new];
+        if (config && [processor startSessionWithConfiguration:config error:nil]) {
+            _fastProcessor = processor;
+            _fastPool = NewPool(config.destinationPixelBufferAttributes, kProcessWidth, kProcessHeight);
+        }
+    }
+    double fastCall = _processor && (_fastProcessor || !_fullPool) ? [self warmUp:YES] : 0;
+    _fastReady = fastCall > 0 && fastCall <= kFastCallLimit;
+    if (!_fastReady && _fastProcessor) {
+        [_fastProcessor endSession];
+        _fastProcessor = nil;
+        CVPixelBufferPoolRelease(_fastPool);
+        _fastPool = NULL;
+    }
+    if (_debug) fprintf(stderr, "smooth: fast-motion middles at 1280x720 phase %.2f above %.1f, %.1f ms a call%s\n",
+                        kFastPhase, _fastAbove, fastCall * 1000, _fastReady ? "" : " (too slow, off)");
     _failed = 0;
     _scaleSum = 0;
     _scaled = 0;
 }
 
-- (CVPixelBufferRef)interpolateFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime {
-    if (!_processor) return NULL;
+- (CVPixelBufferRef)interpolateFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime
+                               fast:(BOOL)fast {
+    VTFrameProcessor *processor = fast && _fastProcessor ? _fastProcessor : _processor;
+    CVPixelBufferPoolRef pool = fast && _fastProcessor ? _fastPool : _middlePool;
+    float phase = fast ? kFastPhase : 0.5f;
+    if (!processor) return NULL;
     CVPixelBufferRef destination = NULL;
-    CVPixelBufferPoolCreatePixelBuffer(NULL, _middlePool, &destination);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &destination);
     if (!destination) return NULL;
     CVBufferPropagateAttachments(current, destination);
     VTFrameProcessorFrame *source = [[VTFrameProcessorFrame alloc] initWithBuffer:current presentationTimeStamp:HostTime(currentTime)];
     VTFrameProcessorFrame *reference = [[VTFrameProcessorFrame alloc] initWithBuffer:previous presentationTimeStamp:HostTime(previousTime)];
-    VTFrameProcessorFrame *output = [[VTFrameProcessorFrame alloc] initWithBuffer:destination presentationTimeStamp:HostTime((previousTime + currentTime) / 2)];
+    VTFrameProcessorFrame *output = [[VTFrameProcessorFrame alloc] initWithBuffer:destination
+                                                           presentationTimeStamp:HostTime(previousTime + phase * (currentTime - previousTime))];
     VTLowLatencyFrameInterpolationParameters *parameters = (source && reference && output) ?
         [[VTLowLatencyFrameInterpolationParameters alloc] initWithSourceFrame:source previousFrame:reference
-                                                           interpolationPhase:@[@0.5f] destinationFrames:@[output]] : nil;
+                                                           interpolationPhase:@[@(phase)] destinationFrames:@[output]] : nil;
     NSError *error = nil;
-    if (!parameters || ![_processor processWithParameters:parameters error:&error]) {
+    if (!parameters || ![processor processWithParameters:parameters error:&error]) {
         if (_failed++ == 0) fprintf(stderr, "smooth: interpolation failed: %s\n", error ? error.description.UTF8String : "frames rejected");
         CVPixelBufferRelease(destination);
         return NULL;
@@ -529,12 +564,22 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
 
         CVPixelBufferRef middleOut = NULL;
         if (_previousFrame && gap > 1.5 * step && gap < 0.100 && !_sceneCut) {
-            double begin = HostNow();
-            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
-            _interpSum += HostNow() - begin;
-            if (middle && _dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
-                [self dumpPrevious:_previousFrame middle:middle current:input];
+            if (_fastMotion ? _lastMean < 0.75 * _fastAbove : _lastMean > _fastAbove) _fastMotion = !_fastMotion;
+            BOOL fast = _fastReady && _fastMotion;
+            CVPixelBufferRef from = _previousFrame, to = input, previousSmall = NULL;
+            if (fast && _fullPool) {
+                CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &previousSmall);
+                fast = previousSmall && VTPixelTransferSessionTransferImage(_transfer, _previousFrame, previousSmall) == noErr;
+                if (fast) { from = previousSmall; to = small; }
             }
+            double begin = HostNow();
+            CVPixelBufferRef middle = [self interpolateFrom:from at:_previousTime to:to at:received fast:fast];
+            _interpSum += HostNow() - begin;
+            if (middle && fast) _fastMiddles++;
+            if (middle && _dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
+                [self dumpPrevious:from middle:middle current:to];
+            }
+            CVPixelBufferRelease(previousSmall);
             if (middle) {
                 _interpolated++;
                 BOOL large = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2;
@@ -573,16 +618,16 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     if (_debug) {
         int shown, missed;
         @synchronized (_pending) { shown = _shown; missed = _missed; _shown = _missed = 0; }
-        fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d | "
+        fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d, fast %d | "
                 "interp %.1f ms, upscale %.1f ms | delay %.1f ms\n",
-                _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts,
+                _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts, _fastMiddles,
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0,
                 _delayCount ? _delaySum / _delayCount * 1000 : 0);
     } else {
         @synchronized (_pending) { _shown = _missed = 0; }
     }
     _statsStart = received;
-    _received = _unique = _interpolated = _scaled = _cuts = _holds = _skipped = _delayCount = 0;
+    _received = _unique = _interpolated = _scaled = _cuts = _holds = _skipped = _delayCount = _fastMiddles = 0;
     _interpSum = _scaleSum = _delaySum = 0;
 }
 
