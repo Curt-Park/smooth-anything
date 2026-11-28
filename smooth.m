@@ -13,6 +13,7 @@ static const double kFullCallLimit = 0.025;
 static const OSType kProcessFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 static const double kCommitLead = 0.013;
 static const double kRepeatRatio = 0.3;
+static const NSInteger kFlowWidth = 640, kFlowHeight = 360;
 
 static double HostNow(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
 static CMTime HostTime(double seconds) { return CMTimeMakeWithSeconds(seconds, 1000000000); }
@@ -36,7 +37,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 @implementation Smoother {
     dispatch_queue_t _queue;
-    BOOL _debug, _debugDiff, _prepared, _wantFull;
+    BOOL _debug, _debugDiff, _prepared, _wantFull, _wantFlow;
     int _failed;
 
     VTFrameProcessor *_processor;
@@ -45,6 +46,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     VTFrameProcessor *_scaler;
     CVPixelBufferPoolRef _scaledPool;
     VTPixelTransferSessionRef _transfer;
+
+    VTFrameProcessor *_flow;
+    OSType _flowInputFormat;
+    CVPixelBufferPoolRef _flowInputPool, _flowFieldPool, _warpPool;
+    CVPixelBufferRef _previousFlowInput, _currentFlowInput;
+    id<MTLRenderPipelineState> _warpLumaPipeline, _warpChromaPipeline;
     CVPixelBufferPoolRef _smallPool;
 
     id<MTLDevice> _device;
@@ -103,6 +110,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _wantFull = getenv("SMOOTH_INTERP_720") == NULL;
+    _wantFlow = getenv("SMOOTH_FLOW") != NULL;
     _upscale = !getenv("SMOOTH_UPSCALE") || atoi(getenv("SMOOTH_UPSCALE")) != 0;
     _sharpen = getenv("SMOOTH_SHARPEN") ? fminf(fmaxf(atof(getenv("SMOOTH_SHARPEN")), 0), 1) : 0.7f;
     if (getenv("SMOOTH_DUMP")) {
@@ -142,6 +150,148 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _fullPool = NULL;
 }
 
+static CVPixelBufferPoolRef NewPlainPool(OSType format, size_t width, size_t height) {
+    NSDictionary *attributes = @{(id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height), (id)kCVPixelBufferPixelFormatTypeKey: @(format),
+                                 (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
+    CVPixelBufferPoolRef pool = NULL;
+    CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &pool);
+    return pool;
+}
+
+// Optical flow on small copies, then the stream's own pixels moved half way along it: the middle keeps their texture,
+// which the 1280x720 interpolation network loses.
+- (void)startFlow {
+    if (![VTOpticalFlowConfiguration isSupported]) return;
+    VTOpticalFlowConfiguration *config = [[VTOpticalFlowConfiguration alloc] initWithFrameWidth:kFlowWidth frameHeight:kFlowHeight
+        qualityPrioritization:VTOpticalFlowConfigurationQualityPrioritizationNormal revision:[VTOpticalFlowConfiguration defaultRevision]];
+    VTFrameProcessor *flow = [VTFrameProcessor new];
+    NSError *error = nil;
+    if (!config || ![flow startSessionWithConfiguration:config error:&error]) {
+        fprintf(stderr, "smooth: optical flow unavailable: %s\n", error ? error.description.UTF8String : "size rejected");
+        return;
+    }
+    static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct Out { float4 position [[position]]; float2 uv; };\n"
+        "vertex Out fullscreen(uint id [[vertex_id]]) {\n"
+        "    float2 p = float2((id << 1) & 2, id & 2);\n"
+        "    Out o; o.position = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
+        "}\n"
+        "fragment float4 warp(Out in [[stage_in]], texture2d<float> first [[texture(0)]], texture2d<float> second [[texture(1)]],\n"
+        "                     texture2d<float> forward [[texture(2)]], texture2d<float> backward [[texture(3)]],\n"
+        "                     constant float &pixelsPerCell [[buffer(0)]]) {\n"
+        "    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
+        "    float2 cell = 1.0 / float2(forward.get_width(), forward.get_height());\n"
+        // Half the flow, read where this middle-frame pixel started from, points back into each real frame.
+        "    float2 f = forward.sample(s, in.uv).rg * cell;\n"
+        "    f = forward.sample(s, in.uv - 0.5 * f).rg * cell;\n"
+        "    float2 b = backward.sample(s, in.uv).rg * cell;\n"
+        "    b = backward.sample(s, in.uv - 0.5 * b).rg * cell;\n"
+        "    float2 fromFirst = in.uv - 0.5 * f, fromSecond = in.uv - 0.5 * b;\n"
+        // The two flows should be opposite; where they are not, that side is hidden or new, so the other one counts more.
+        "    float2 firstError = (f + backward.sample(s, in.uv + 0.5 * f).rg * cell) / cell * pixelsPerCell;\n"
+        "    float2 secondError = (b + forward.sample(s, in.uv + 0.5 * b).rg * cell) / cell * pixelsPerCell;\n"
+        "    float firstWeight = 1.0 / (1.0 + dot(firstError, firstError)), secondWeight = 1.0 / (1.0 + dot(secondError, secondError));\n"
+        "    if (any(fromFirst < 0.0) || any(fromFirst > 1.0)) firstWeight *= 0.001;\n"
+        "    if (any(fromSecond < 0.0) || any(fromSecond > 1.0)) secondWeight *= 0.001;\n"
+        "    return (firstWeight * first.sample(s, fromFirst) + secondWeight * second.sample(s, fromSecond)) / (firstWeight + secondWeight);\n"
+        "}\n";
+    id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
+    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = [library newFunctionWithName:@"fullscreen"];
+    descriptor.fragmentFunction = [library newFunctionWithName:@"warp"];
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+    _warpLumaPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRG8Unorm;
+    _warpChromaPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+    if (!_warpLumaPipeline || !_warpChromaPipeline) {
+        fprintf(stderr, "smooth: cannot set up the flow warp: %s\n", error.localizedDescription.UTF8String);
+        [flow endSession];
+        return;
+    }
+    NSDictionary *field = config.destinationPixelBufferAttributes;
+    _flowInputFormat = config.frameSupportedPixelFormats.firstObject.unsignedIntValue;
+    _flowInputPool = NewPlainPool(_flowInputFormat, kFlowWidth, kFlowHeight);
+    _flowFieldPool = NewPlainPool(kCVPixelFormatType_TwoComponent16Half, [field[(id)kCVPixelBufferWidthKey] unsignedLongValue],
+                                  [field[(id)kCVPixelBufferHeightKey] unsignedLongValue]);
+    _flow = flow;
+}
+
+- (CVPixelBufferRef)flowInput:(CVPixelBufferRef)frame {
+    CVPixelBufferRef input = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _flowInputPool, &input);
+    if (input && VTPixelTransferSessionTransferImage(_transfer, frame, input) != noErr) { CVPixelBufferRelease(input); input = NULL; }
+    return input;
+}
+
+- (id<MTLTexture>)texture:(CVPixelBufferRef)buffer plane:(size_t)plane format:(MTLPixelFormat)format keep:(NSMutableArray *)keep {
+    CVMetalTextureRef texture = NULL;
+    BOOL planar = CVPixelBufferIsPlanar(buffer);
+    size_t width = planar ? CVPixelBufferGetWidthOfPlane(buffer, plane) : CVPixelBufferGetWidth(buffer);
+    size_t height = planar ? CVPixelBufferGetHeightOfPlane(buffer, plane) : CVPixelBufferGetHeight(buffer);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textures, buffer, NULL, format, width, height, plane, &texture);
+    if (!texture) return nil;
+    [keep addObject:(__bridge_transfer id)texture];
+    return CVMetalTextureGetTexture((__bridge CVMetalTextureRef)keep.lastObject);
+}
+
+- (CVPixelBufferRef)flowMiddleFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime {
+    OSType format = CVPixelBufferGetPixelFormatType(current);
+    size_t width = CVPixelBufferGetWidth(current), height = CVPixelBufferGetHeight(current);
+    if (CVPixelBufferGetPixelFormatType(previous) != format || CVPixelBufferGetWidth(previous) != width || CVPixelBufferGetHeight(previous) != height) return NULL;
+    if (!_previousFlowInput) _previousFlowInput = [self flowInput:previous];
+    CVPixelBufferRelease(_currentFlowInput);
+    _currentFlowInput = [self flowInput:current];
+    CVPixelBufferRef forward = NULL, backward = NULL, destination = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _flowFieldPool, &forward);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _flowFieldPool, &backward);
+    if (_warpPool) {
+        NSDictionary *made = (__bridge NSDictionary *)CVPixelBufferPoolGetPixelBufferAttributes(_warpPool);
+        if ([made[(id)kCVPixelBufferPixelFormatTypeKey] unsignedIntValue] != format || [made[(id)kCVPixelBufferWidthKey] unsignedLongValue] != width
+            || [made[(id)kCVPixelBufferHeightKey] unsignedLongValue] != height) { CVPixelBufferPoolRelease(_warpPool); _warpPool = NULL; }
+    }
+    if (!_warpPool) _warpPool = NewPlainPool(format, width, height);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _warpPool, &destination);
+
+    BOOL done = NO;
+    if (_previousFlowInput && _currentFlowInput && forward && backward && destination) {
+        VTFrameProcessorFrame *source = [[VTFrameProcessorFrame alloc] initWithBuffer:_previousFlowInput presentationTimeStamp:HostTime(previousTime)];
+        VTFrameProcessorFrame *next = [[VTFrameProcessorFrame alloc] initWithBuffer:_currentFlowInput presentationTimeStamp:HostTime(currentTime)];
+        VTFrameProcessorOpticalFlow *field = [[VTFrameProcessorOpticalFlow alloc] initWithForwardFlow:forward backwardFlow:backward];
+        VTOpticalFlowParameters *parameters = (source && next && field) ?
+            [[VTOpticalFlowParameters alloc] initWithSourceFrame:source nextFrame:next submissionMode:VTOpticalFlowParametersSubmissionModeRandom
+                                          destinationOpticalFlow:field] : nil;
+        NSError *error = nil;
+        if (parameters && [_flow processWithParameters:parameters error:&error]) {
+            NSMutableArray *keep = [NSMutableArray array];
+            id<MTLTexture> forwardTexture = [self texture:forward plane:0 format:MTLPixelFormatRG16Float keep:keep];
+            id<MTLTexture> backwardTexture = [self texture:backward plane:0 format:MTLPixelFormatRG16Float keep:keep];
+            id<MTLCommandBuffer> commands = [_commands commandBuffer];
+            BOOL drawn = forwardTexture && backwardTexture;
+            for (size_t plane = 0; plane < 2 && drawn; plane++) {
+                MTLPixelFormat planeFormat = plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm;
+                id<MTLTexture> first = [self texture:previous plane:plane format:planeFormat keep:keep];
+                id<MTLTexture> second = [self texture:current plane:plane format:planeFormat keep:keep];
+                id<MTLTexture> target = [self texture:destination plane:plane format:planeFormat keep:keep];
+                drawn = first && second && target;
+                if (drawn) [self draw:(plane ? _warpChromaPipeline : _warpLumaPipeline) into:target from:@[first, second, forwardTexture, backwardTexture]
+                                value:(float)width / (float)forwardTexture.width commands:commands];
+            }
+            if (drawn) {
+                [commands commit];
+                [commands waitUntilCompleted];
+                CVBufferPropagateAttachments(current, destination);
+                done = commands.status == MTLCommandBufferStatusCompleted;
+            }
+        } else if (_failed++ == 0) {
+            fprintf(stderr, "smooth: optical flow failed: %s\n", error ? error.description.UTF8String : "frames rejected");
+        }
+    }
+    CVPixelBufferRelease(forward);
+    CVPixelBufferRelease(backward);
+    if (!done) { CVPixelBufferRelease(destination); destination = NULL; }
+    return destination;
+}
+
 // Runs a few calls on blank frames so the first real ones are not slow, and returns the fastest warm call in seconds.
 - (double)warmUp {
     CVPixelBufferPoolRef inputPool = _fullPool ?: _smallPool;
@@ -168,7 +318,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _prepared = YES;
     BOOL supported = [VTLowLatencyFrameInterpolationConfiguration isSupported];
     // Above 1280x720's pixels the interpolator switches to a slower network whose middle frames are closer to the real ones.
-    if (supported && _wantFull) [self startInterpolatorWidth:kFullWidth height:kFullHeight];
+    if (supported && _wantFull && !_wantFlow) [self startInterpolatorWidth:kFullWidth height:kFullHeight];
     if (supported && !_processor) [self startInterpolatorWidth:kProcessWidth height:kProcessHeight];
     if ([VTLowLatencySuperResolutionScalerConfiguration isSupported]) {
         NSArray<NSNumber *> *factors = [VTLowLatencySuperResolutionScalerConfiguration supportedScaleFactorsForFrameWidth:kProcessWidth frameHeight:kProcessHeight];
@@ -184,6 +334,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     }
     VTPixelTransferSessionCreate(NULL, &_transfer);
     _smallPool = NewPool(nil, kProcessWidth, kProcessHeight);
+    if (_wantFlow) [self startFlow];
 
     double call = [self warmUp];
     // A slower Mac (an M1 takes about 100 ms at 1080p) would miss nearly every middle frame, so it keeps 1280x720.
@@ -194,6 +345,24 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         call = [self warmUp];
     }
     if (_debug) fprintf(stderr, "smooth: interpolating at %s, %.1f ms a call\n", _fullPool ? "1920x1080" : "1280x720", call * 1000);
+    if (_flow) {
+        CVPixelBufferRef blankA = NULL, blankB = NULL;
+        CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankA);
+        CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankB);
+        double fastest = 0;
+        for (int round = 0; round < 3 && blankA && blankB; round++) {
+            double begin = HostNow();
+            CVPixelBufferRelease([self flowMiddleFrom:blankA at:0 to:blankB at:1.0 / 30]);
+            if (round > 0 && (fastest == 0 || HostNow() - begin < fastest)) fastest = HostNow() - begin;
+            CVPixelBufferRelease(_previousFlowInput);
+            _previousFlowInput = NULL;
+        }
+        CVPixelBufferRelease(_currentFlowInput);
+        _currentFlowInput = NULL;
+        CVPixelBufferRelease(blankA);
+        CVPixelBufferRelease(blankB);
+        if (_debug) fprintf(stderr, "smooth: middle frames from optical flow, %.1f ms a call\n", fastest * 1000);
+    }
     _failed = 0;
     _scaleSum = 0;
     _scaled = 0;
@@ -622,7 +791,9 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
     _previousFrame = _restFrame;
     _previousTime = _restTime;
     CVPixelBufferRelease(_previousNative);
-    _previousNative = NULL;
+    _previousNative = (_dumpDirectory || _flow) ? CVPixelBufferRetain(_restNative) : NULL;
+    CVPixelBufferRelease(_previousFlowInput);
+    _previousFlowInput = NULL;
     _restFrame = NULL;
     CVPixelBufferRelease(_restNative);
     _restNative = NULL;
@@ -656,8 +827,15 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
         CVPixelBufferRef middleOut = NULL;
         if (_previousFrame && gap > 1.5 * step && gap < 0.100 && !_sceneCut) {
             double begin = HostNow();
-            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
+            if (_flow && _previousNative) middleOut = [self flowMiddleFrom:_previousNative at:_previousTime to:native at:received];
+            CVPixelBufferRef middle = middleOut ? NULL : [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
             _interpSum += HostNow() - begin;
+            if (middleOut) {
+                _interpolated++;
+                if (_dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
+                    [self dumpPrevious:_previousNative middle:middleOut current:native nativePrevious:NULL nativeCurrent:NULL];
+                }
+            }
             if (middle && _dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
                 [self dumpPrevious:_previousFrame middle:middle current:input nativePrevious:_previousNative nativeCurrent:native];
             }
@@ -693,7 +871,10 @@ static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
         _previousFrame = CVPixelBufferRetain(input);
         _previousTime = received;
         CVPixelBufferRelease(_previousNative);
-        _previousNative = _dumpDirectory ? CVPixelBufferRetain(native) : NULL;
+        _previousNative = (_dumpDirectory || _flow) ? CVPixelBufferRetain(native) : NULL;
+        CVPixelBufferRelease(_previousFlowInput);
+        _previousFlowInput = _currentFlowInput;
+        _currentFlowInput = NULL;
     }
 
     double elapsed = received - _statsStart;

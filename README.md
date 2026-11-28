@@ -72,6 +72,7 @@ downloaded app.
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
+| `SMOOTH_FLOW=1` | Experimental: make middle frames by moving the stream's own pixels half way along `VTOpticalFlow` (run on 640x360 copies) instead of the interpolation network. Meant for Macs that fall back to 720p interpolation, whose network loses background texture in fast camera moves |
 | `SMOOTH_UPSCALE=0` | Let Core Animation stretch the frame instead of MetalFX upscaling and sharpening |
 | `SMOOTH_SHARPEN=<0–1>` | Sharpening strength after the MetalFX upscale. Default 0.7; 0 turns it off |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds, and how many refreshes after its target each frame reached the screen (a steady offset is compositor latency; `shifts` counts changes, which show as judder) |
